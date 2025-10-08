@@ -41,7 +41,7 @@ lista_original_revisores = [
     "rebeca.benavides@iie.cl","rocio.betancur@iie.cl","rocio.concha@iie.cl",
     "rocio.vasquez@iie.cl","rodrigo.zamorano@iie.cl","stefany.leon@iie.cl",
     "tomas.andrade@iie.cl","valeria.henriquezvilla@iie.cl","veronica.gutierrez@iie.cl",
-    "ximena.bastias@iie.cl","pablo.casanueva@iie.cl","pavlo.saldano@iie.cl","valentina.altamirano@iie.cl"
+    "ximena.bastias@iie.cl","pablo.casanueva@iie.cl","pavlo.saldano@iie.cl","valentina.altamirano@iie.cl",,"valentina.altamirano@iie.cl","amapola.cirano@iie.cl","lukas.redel@iie.cl","antonia.lomboy@iie.cl", "carol.nova@iie.cl"
 ]
 
 # Lista de revisores en session_state
