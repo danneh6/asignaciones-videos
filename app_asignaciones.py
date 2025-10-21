@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 import plotly.express as px
+import numpy as np
 
 # Configuración de página
 st.set_page_config(layout="wide", page_title="Asignación de Videos")
@@ -31,10 +32,10 @@ st.title("📊 Asignación de Videos a Revisores")
 # --- Subir archivo CSV ---
 uploaded_file = st.file_uploader("Cargar reporte diario (CSV)", type="csv")
 
-# Lista inicial de revisores
+# Lista inicial de revisores  (FIX: se elimina coma suelta)
 lista_original_revisores = [
     "antonia.cutino@iie.cl","antonia.rios@iie.cl","claudia.sanjuan@iie.cl",
-    "diego.moya@iie.cl","daniela.medel@iie.cl", "alexandra.castro@iie.cl",
+    "diego.moya@iie.cl","alexandra.castro@iie.cl",
     "isabella.iubini@iie.cl","javiera.arriagada@iie.cl","katherine.marilaf@iie.cl",
     "javiera.narvaez@iie.cl","maria.salinas@iie.cl",
     "kerim.segura@iie.cl","pamela.alarcon@iie.cl","pedro.salinas@iie.cl",
@@ -42,7 +43,7 @@ lista_original_revisores = [
     "rodrigo.zamorano@iie.cl","stefany.leon@iie.cl",
     "tomas.andrade@iie.cl","valeria.henriquezvilla@iie.cl","veronica.gutierrez@iie.cl",
     "ximena.bastias@iie.cl","pablo.casanueva@iie.cl","pavlo.saldano@iie.cl","valentina.altamirano@iie.cl",
-    "amapola.cirano@iie.cl","lukas.redel@iie.cl","antonia.lomboy@iie.cl", "carol.nova@iie.cl",
+    "amapola.cirano@iie.cl","lukas.redel@iie.cl","antonia.lomboy@iie.cl","carol.nova@iie.cl",
     "leslee.garrido@iie.cl"
 ]
 # Lista de revisores en session_state
@@ -56,15 +57,58 @@ omitidos_top3 = [
     "veronica.gutierrez@iie.cl"
 ]
 
-# Estado de asignaciones temporalesvalentina.altamirano@iie.cl
+# Estado de asignaciones temporales
 if "asignaciones" not in st.session_state:
     st.session_state["asignaciones"] = []
+
+# ---- Helper: parseo robusto de fecha_carga_bucket ----
+def parsear_fecha_bucket(serie):
+    """
+    Intenta parsear fechas en múltiples formatos:
+    - Texto con dayfirst=True (dd/mm/yyyy)
+    - Texto con dayfirst=False (yyyy-mm-dd)
+    - Epoch en segundos o milisegundos
+    Devuelve una Serie datetime (NaT donde no se pudo).
+    """
+    s = serie.copy()
+
+    # Si es numérica (o string de dígitos), intentamos epoch
+    s_digits = s.astype(str).str.fullmatch(r"\d+")
+    if s_digits.fillna(False).any():
+        # convertimos a float para evaluar magnitudes
+        s_num = pd.to_numeric(s.where(s_digits, np.nan), errors="coerce")
+        # heurística: >1e12 ~ ms, >1e9 ~ s
+        if s_num.dropna().gt(1e12).mean() > 0.5:
+            dt = pd.to_datetime(s_num, unit="ms", errors="coerce")
+            if dt.notna().any():
+                return dt
+        if s_num.dropna().gt(1e9).mean() > 0.5:
+            dt = pd.to_datetime(s_num, unit="s", errors="coerce")
+            if dt.notna().any():
+                return dt
+
+    # Intento 1: dayfirst=True
+    dt1 = pd.to_datetime(s, errors="coerce", dayfirst=True)
+    # Si casi todo fue NaT, probamos sin dayfirst
+    if dt1.isna().mean() > 0.8:
+        dt2 = pd.to_datetime(s, errors="coerce", dayfirst=False)
+        # Nos quedamos con el que “parsea” más
+        if dt2.isna().mean() < dt1.isna().mean():
+            return dt2
+    return dt1
+
+# Función para limpiar nombre de email
+def nombre_limpio(email):
+    try:
+        return email.split("@")[0].replace(".", " ").title()
+    except Exception:
+        return "(sin revisor)"
 
 if uploaded_file is not None:
     try:
         # Leer CSV
         df = pd.read_csv(uploaded_file, encoding="utf-8-sig", sep=None, engine="python")
-        df.columns = df.columns.str.strip().str.replace('"', "").str.replace("﻿", "")
+        df.columns = df.columns.str.strip().str.replace('"', "", regex=False).str.replace("﻿", "", regex=False)
 
         # ✅ Crear columna "llave" y eliminar duplicados
         if all(col in df.columns for col in ["id_revision", "estado_nombre", "tipo_incidencia"]):
@@ -80,21 +124,45 @@ if uploaded_file is not None:
         else:
             st.warning("⚠️ No se encontraron todas las columnas necesarias para generar la llave (id_revision, estado_nombre, tipo_incidencia).")
 
-        # Pendientes sin revisor
+        # ------------------- Pendientes sin revisor -------------------
         pendientes_sin_revisor = df[
             (df["revisor"].isna()) & (df["estado_nombre"] == "pendiente_de_revision")
-        ]
-        pendientes_sin_revisor = pendientes_sin_revisor.drop_duplicates(subset=["rut_docente"])
-        pendientes_shuffled = pendientes_sin_revisor.sample(frac=1, random_state=42).reset_index(drop=True)
+        ].copy()
+
+        # Un docente solo una vez
+        if "rut_docente" in pendientes_sin_revisor.columns:
+            pendientes_sin_revisor = pendientes_sin_revisor.drop_duplicates(subset=["rut_docente"])
+
+        # Orden por fecha_carga_bucket (si existe); si no, mantenemos orden original
+        if "fecha_carga_bucket" in pendientes_sin_revisor.columns:
+            st.markdown("#### Orden de asignación por fecha de carga")
+            orden_default = "Más antiguo → más reciente"
+            orden = st.radio(
+                "Elegir prioridad",
+                [orden_default, "Más reciente → más antiguo"],
+                index=0,
+                horizontal=True
+            )
+
+            fechas_dt = parsear_fecha_bucket(pendientes_sin_revisor["fecha_carga_bucket"])
+            pendientes_sin_revisor["_fecha_dt"] = fechas_dt
+
+            if pendientes_sin_revisor["_fecha_dt"].notna().any():
+                asc = (orden == orden_default)
+                pendientes_ordenados = pendientes_sin_revisor.sort_values(
+                    by=["_fecha_dt", "rut_docente" if "rut_docente" in pendientes_sin_revisor.columns else pendientes_sin_revisor.index.name],
+                    ascending=[asc, True]
+                ).drop(columns=["_fecha_dt"])
+            else:
+                st.info("ℹ️ No se pudo interpretar 'fecha_carga_bucket'. Se mantiene el orden original.")
+                pendientes_ordenados = pendientes_sin_revisor.copy()
+        else:
+            pendientes_ordenados = pendientes_sin_revisor.copy()
 
         # Layout columnas: izquierda (ranking + asignación), derecha (Top3 + gráficos)
         col_left, col_right = st.columns([3,1])
 
-        # Función para limpiar nombre de email
-        def nombre_limpio(email):
-            return email.split("@")[0].replace(".", " ").title()
-
-        # Columna izquierda
+        # ------------------- Columna izquierda -------------------
         with col_left:
             # Ranking de carga
             resumen = []
@@ -145,8 +213,8 @@ if uploaded_file is not None:
                         del st.session_state["seleccion_temporal"][revisor_a_eliminar]
                     st.success(f"🗑️ Revisor eliminado: {revisor_a_eliminar}")
 
-            # Total de pendientes
-            pendientes_restantes = len(pendientes_sin_revisor) - len(st.session_state["asignaciones"])
+            # Total de pendientes (basado en la lista ordenada)
+            pendientes_restantes = len(pendientes_ordenados) - len(st.session_state["asignaciones"])
 
             # Función para recalcular max_value
             def actualizar_maximos():
@@ -154,7 +222,7 @@ if uploaded_file is not None:
                 maximos = {}
                 for rev in st.session_state["revisores"]:
                     max_valor = pendientes_restantes - totales_seleccionados + st.session_state["seleccion_temporal"][rev]
-                    maximos[rev] = max(max_valor, 0)
+                    maximos[rev] = max(int(max_valor), 0)
                 return maximos
 
             maximos_revisores = actualizar_maximos()
@@ -162,8 +230,8 @@ if uploaded_file is not None:
             # Mostrar cada revisor en fila unificada con input
             for revisor in st.session_state["revisores"]:
                 carga_actual = int(resumen_df.loc[resumen_df["revisor"] == revisor, "pendientes_asignados"].values[0]) if revisor in resumen_df["revisor"].values else 0
-                cantidad_actual = st.session_state["seleccion_temporal"].get(revisor, 0)
-                maximo = maximos_revisores[revisor]
+                cantidad_actual = int(st.session_state["seleccion_temporal"].get(revisor, 0))
+                maximo = int(maximos_revisores.get(revisor, 0))
 
                 with st.container():
                     col_name, col_input = st.columns([3,2])
@@ -178,7 +246,7 @@ if uploaded_file is not None:
                             step=1,
                             key=f"num_{revisor}"
                         )
-                    st.session_state["seleccion_temporal"][revisor] = cantidad
+                    st.session_state["seleccion_temporal"][revisor] = int(cantidad)
                     maximos_revisores = actualizar_maximos()
 
             # Contador flotante siempre presente
@@ -191,21 +259,27 @@ if uploaded_file is not None:
                 color = "#f8d7da"
             st.markdown(
                 f"""<div style="position: fixed; bottom: 20px; right: 20px; background-color:{color}; padding:20px; border-radius:15px; border:2px solid #ff9900; text-align:center; font-size:20px; font-weight:bold; z-index:999;">
-                ⚠️ Videos pendientes sin asignar: {pendientes_aun}
+                ⚠️ Videos pendientes sin asignar: {max(int(pendientes_aun), 0)}
                 </div>""",
                 unsafe_allow_html=True
             )
 
-            # Botón para asignar videos
+            # Botón para asignar videos (usa el orden por fecha)
             if st.button("▶️ Asignar videos seleccionados"):
-                for revisor, cant in st.session_state["seleccion_temporal"].items():
-                    if cant > 0:
-                        seleccionados = pendientes_sin_revisor.head(cant)
-                        pendientes_sin_revisor = pendientes_sin_revisor.iloc[cant:]
-                        for rut in seleccionados["rut_docente"].tolist():
-                            if rut not in [x["rut_docente"] for x in st.session_state["asignaciones"]]:
-                                st.session_state["asignaciones"].append({"id_revisor": revisor, "rut_docente": rut})
-                        st.session_state["seleccion_temporal"][revisor] = 0
+                if pendientes_ordenados.empty:
+                    st.info("No hay pendientes sin revisor para asignar.")
+                else:
+                    pool = pendientes_ordenados.copy()
+                    for revisor, cant in st.session_state["seleccion_temporal"].items():
+                        cant = int(cant)
+                        if cant > 0 and not pool.empty:
+                            seleccionados = pool.head(cant)
+                            pool = pool.iloc[cant:]
+                            for rut in seleccionados["rut_docente"].tolist():
+                                if rut not in [x["rut_docente"] for x in st.session_state["asignaciones"]]:
+                                    st.session_state["asignaciones"].append({"id_revisor": revisor, "rut_docente": rut})
+                            st.session_state["seleccion_temporal"][revisor] = 0
+                    st.success("✅ Asignaciones realizadas.")
 
             # Mostrar asignaciones
             if st.session_state["asignaciones"]:
@@ -221,7 +295,7 @@ if uploaded_file is not None:
                     mime="text/csv"
                 )
 
-        # Columna derecha (Top3 y gráficos)
+        # ------------------- Columna derecha (Top3 y gráficos) -------------------
         with col_right:
             df_top = df[~df["revisor"].isin(omitidos_top3)]
             df_aprobado = df_top[df_top["estado_incidencia"] == "Aprobado"]
