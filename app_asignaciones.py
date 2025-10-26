@@ -75,7 +75,6 @@ def parsear_fecha_bucket(serie):
     # Si es numérica (o string de dígitos), intentamos epoch
     s_digits = s.astype(str).str.fullmatch(r"\d+")
     if s_digits.fillna(False).any():
-        # convertimos a float para evaluar magnitudes
         s_num = pd.to_numeric(s.where(s_digits, np.nan), errors="coerce")
         # heurística: >1e12 ~ ms, >1e9 ~ s
         if s_num.dropna().gt(1e12).mean() > 0.5:
@@ -92,7 +91,6 @@ def parsear_fecha_bucket(serie):
     # Si casi todo fue NaT, probamos sin dayfirst
     if dt1.isna().mean() > 0.8:
         dt2 = pd.to_datetime(s, errors="coerce", dayfirst=False)
-        # Nos quedamos con el que “parsea” más
         if dt2.isna().mean() < dt1.isna().mean():
             return dt2
     return dt1
@@ -110,7 +108,8 @@ if uploaded_file is not None:
         df = pd.read_csv(uploaded_file, encoding="utf-8-sig", sep=None, engine="python")
         df.columns = df.columns.str.strip().str.replace('"', "", regex=False).str.replace("﻿", "", regex=False)
 
-        # ✅ Crear columna "llave" y eliminar duplicados
+        # ================== DEDUP EXACTO COMO EN EXCEL ==================
+        # 1) Crear columna "llave" = id_revision + estado_nombre + tipo_incidencia
         if all(col in df.columns for col in ["id_revision", "estado_nombre", "tipo_incidencia"]):
             df["llave"] = (
                 df["id_revision"].astype(str)
@@ -120,18 +119,27 @@ if uploaded_file is not None:
             antes = len(df)
             df = df.drop_duplicates(subset=["llave"])
             eliminados = antes - len(df)
-            st.success(f"🔑 Columna 'llave' creada. Se eliminaron {eliminados} duplicados basados en esa combinación.")
+            st.success(f"🔑 'llave' creada. Eliminados {eliminados} duplicados por llave.")
         else:
-            st.warning("⚠️ No se encontraron todas las columnas necesarias para generar la llave (id_revision, estado_nombre, tipo_incidencia).")
+            st.warning("⚠️ Faltan columnas para generar 'llave' (id_revision, estado_nombre, tipo_incidencia). Se continúa sin este paso.")
+
+        # 2) Eliminar duplicados por 'rut_docente' (después de limpiar por llave)
+        if "rut_docente" in df.columns:
+            antes_rut = len(df)
+            df = df.drop_duplicates(subset=["rut_docente"])
+            eliminados_rut = antes_rut - len(df)
+            st.success(f"🧹 Eliminados {eliminados_rut} duplicados por 'rut_docente'.")
+        else:
+            st.info("ℹ️ No existe la columna 'rut_docente'; no se pudo deduplicar por docente.")
 
         # ------------------- Pendientes sin revisor -------------------
-        pendientes_sin_revisor = df[
-            (df["revisor"].isna()) & (df["estado_nombre"] == "pendiente_de_revision")
-        ].copy()
-
-        # Un docente solo una vez
-        if "rut_docente" in pendientes_sin_revisor.columns:
-            pendientes_sin_revisor = pendientes_sin_revisor.drop_duplicates(subset=["rut_docente"])
+        # Nota: ya deduplicamos globalmente por rut_docente arriba; aquí solo filtramos
+        if all(c in df.columns for c in ["revisor", "estado_nombre"]):
+            pendientes_sin_revisor = df[
+                (df["revisor"].isna()) & (df["estado_nombre"] == "pendiente_de_revision")
+            ].copy()
+        else:
+            pendientes_sin_revisor = pd.DataFrame(columns=["rut_docente"])
 
         # Orden por fecha_carga_bucket (si existe); si no, mantenemos orden original
         if "fecha_carga_bucket" in pendientes_sin_revisor.columns:
@@ -167,10 +175,14 @@ if uploaded_file is not None:
             # Ranking de carga
             resumen = []
             for rev in st.session_state["revisores"]:
-                df_rev = df[df["revisor"] == rev]
-                revisados = df_rev[df_rev["estado_nombre"].isin(["sin_incidencias","con_incidencias_a_revisar"])].shape[0]
-                en_revision = df_rev[df_rev["estado_nombre"] == "en_revision"].shape[0]
-                pendientes_asignados = df_rev[df_rev["estado_nombre"] == "pendiente_de_revision"].shape[0]
+                if "revisor" in df.columns and "estado_nombre" in df.columns:
+                    df_rev = df[df["revisor"] == rev]
+                    revisados = df_rev[df_rev["estado_nombre"].isin(["sin_incidencias","con_incidencias_a_revisar"])].shape[0]
+                    en_revision = df_rev[df_rev["estado_nombre"] == "en_revision"].shape[0]
+                    pendientes_asignados = df_rev[df_rev["estado_nombre"] == "pendiente_de_revision"].shape[0]
+                else:
+                    revisados = en_revision = pendientes_asignados = 0
+
                 resumen.append({
                     "revisor": rev,
                     "revisados": revisados,
@@ -285,7 +297,7 @@ if uploaded_file is not None:
             if st.session_state["asignaciones"]:
                 resultado = pd.DataFrame(st.session_state["asignaciones"])
                 st.subheader("📄 Vista previa de asignaciones")
-                st.dataframe(resultado.head(20))
+                st.dataframe(resultado.head(20), use_container_width=True)
                 csv_buffer = BytesIO()
                 resultado.to_csv(csv_buffer, index=False, sep=";")
                 st.download_button(
@@ -297,50 +309,71 @@ if uploaded_file is not None:
 
         # ------------------- Columna derecha (Top3 y gráficos) -------------------
         with col_right:
-            df_top = df[~df["revisor"].isin(omitidos_top3)]
-            df_aprobado = df_top[df_top["estado_incidencia"] == "Aprobado"]
-            top_aprobado = df_aprobado.groupby("revisor").size() / df_top.groupby("revisor").size() * 100
-            top_aprobado = top_aprobado.dropna().sort_values(ascending=False).head(3).round(0).astype(int)
-            st.subheader("🏆 Top 3 incidencias aprobadas")
-            for rev, pct in top_aprobado.items():
-                st.markdown(f"""<div style="background-color:#cde8ff;padding:10px;border-radius:10px;margin-bottom:5px;text-align:center;font-weight:bold;">{nombre_limpio(rev)}<br>{pct}%</div>""", unsafe_allow_html=True)
+            if "revisor" in df.columns:
+                df_top = df[~df["revisor"].isin(omitidos_top3)]
+            else:
+                df_top = df.copy()
 
-            df_no_aprobado = df_top[df_top["estado_incidencia"] == "No Aprobado"]
-            top_no_aprobado = df_no_aprobado.groupby("revisor").size() / df_top.groupby("revisor").size() * 100
-            top_no_aprobado = top_no_aprobado.dropna().sort_values(ascending=False).head(3).round(0).astype(int)
-            st.subheader("🏆 Top 3 incidencias no aprobadas")
-            for rev, pct in top_no_aprobado.items():
-                st.markdown(f"""<div style="background-color:#ffc9c9;padding:10px;border-radius:10px;margin-bottom:5px;text-align:center;font-weight:bold;">{nombre_limpio(rev)}<br>{pct}%</div>""", unsafe_allow_html=True)
+            if "estado_incidencia" in df.columns and "revisor" in df_top.columns:
+                df_aprobado = df_top[df_top["estado_incidencia"] == "Aprobado"]
+                top_aprobado = df_aprobado.groupby("revisor").size() / df_top.groupby("revisor").size() * 100
+                top_aprobado = top_aprobado.dropna().sort_values(ascending=False).head(3).round(0).astype(int)
+                st.subheader("🏆 Top 3 incidencias aprobadas")
+                if top_aprobado.empty:
+                    st.write("Sin datos suficientes.")
+                else:
+                    for rev, pct in top_aprobado.items():
+                        st.markdown(f"""<div style="background-color:#cde8ff;padding:10px;border-radius:10px;margin-bottom:5px;text-align:center;font-weight:bold;">{nombre_limpio(rev)}<br>{pct}%</div>""", unsafe_allow_html=True)
 
-            df_videos = df.drop_duplicates(subset=["rut_docente"])
-            revisados = df_videos[df_videos["estado_nombre"].isin(["sin_incidencias","con_incidencias_a_revisar"])].shape[0]
-            en_revision = df_videos[df_videos["estado_nombre"] == "en_revision"].shape[0]
-            pendiente_total = df_videos[df_videos["estado_nombre"] == "pendiente_de_revision"].shape[0]
+                df_no_aprobado = df_top[df_top["estado_incidencia"] == "No Aprobado"]
+                top_no_aprobado = df_no_aprobado.groupby("revisor").size() / df_top.groupby("revisor").size() * 100
+                top_no_aprobado = top_no_aprobado.dropna().sort_values(ascending=False).head(3).round(0).astype(int)
+                st.subheader("🏆 Top 3 incidencias no aprobadas")
+                if top_no_aprobado.empty:
+                    st.write("Sin datos suficientes.")
+                else:
+                    for rev, pct in top_no_aprobado.items():
+                        st.markdown(f"""<div style="background-color:#ffc9c9;padding:10px;border-radius:10px;margin-bottom:5px;text-align:center;font-weight:bold;">{nombre_limpio(rev)}<br>{pct}%</div>""", unsafe_allow_html=True)
 
-            fig_torta = px.pie(
-                names=["Revisados", "En revisión", "Pendientes"],
-                values=[revisados, en_revision, pendiente_total],
-                color=["Revisados", "En revisión", "Pendientes"],
-                color_discrete_map={"Revisados": "#a1d99b", "En revisión": "#9ecae1", "Pendientes": "#fdae6b"},
-                title="📊 Distribución de videos"
-            )
-            fig_torta.update_traces(textinfo="label+value", textfont_size=14)
-            st.plotly_chart(fig_torta, use_container_width=True)
+            # Gráfico de distribución
+            if "estado_nombre" in df.columns:
+                df_videos = df.drop_duplicates(subset=["rut_docente"]) if "rut_docente" in df.columns else df.copy()
+                revisados = df_videos[df_videos["estado_nombre"].isin(["sin_incidencias","con_incidencias_a_revisar"])].shape[0]
+                en_revision = df_videos[df_videos["estado_nombre"] == "en_revision"].shape[0]
+                pendiente_total = df_videos[df_videos["estado_nombre"] == "pendiente_de_revision"].shape[0]
+
+                fig_torta = px.pie(
+                    names=["Revisados", "En revisión", "Pendientes"],
+                    values=[revisados, en_revision, pendiente_total],
+                    color=["Revisados", "En revisión", "Pendientes"],
+                    color_discrete_map={"Revisados": "#a1d99b", "En revisión": "#9ecae1", "Pendientes": "#fdae6b"},
+                    title="📊 Distribución de videos"
+                )
+                fig_torta.update_traces(textinfo="label+value", textfont_size=14)
+                st.plotly_chart(fig_torta, use_container_width=True)
 
             # Top 3 incidencias por tipo
-            df_top_tipo = df[df["estado_incidencia"] == "Aprobado"]
-            top_tipo_aprobado = df_top_tipo.groupby("tipo_incidencia").size() / len(df_top_tipo) * 100
-            top_tipo_aprobado = top_tipo_aprobado.sort_values(ascending=False).head(3).round(0).astype(int)
-            st.subheader("🏆 Top 3 incidencias aprobadas por tipo")
-            for tipo, pct in top_tipo_aprobado.items():
-                st.markdown(f"""<div style="background-color:#cde8ff;padding:10px;border-radius:10px;margin-bottom:5px;text-align:center;font-weight:bold;">{tipo}<br>{pct}%</div>""", unsafe_allow_html=True)
-
-            df_top_tipo_na = df[df["estado_incidencia"] == "No Aprobado"]
-            top_tipo_no_aprobado = df_top_tipo_na.groupby("tipo_incidencia").size() / len(df_top_tipo_na) * 100
-            top_tipo_no_aprobado = top_tipo_no_aprobado.sort_values(ascending=False).head(3).round(0).astype(int)
-            st.subheader("🏆 Top 3 incidencias no aprobadas por tipo")
-            for tipo, pct in top_tipo_no_aprobado.items():
-                st.markdown(f"""<div style="background-color:#ffc9c9;padding:10px;border-radius:10px;margin-bottom:5px;text-align:center;font-weight:bold;">{tipo}<br>{pct}%</div>""", unsafe_allow_html=True)
+            if "estado_incidencia" in df.columns and "tipo_incidencia" in df.columns:
+                df_top_tipo = df[df["estado_incidencia"] == "Aprobado"]
+                if len(df_top_tipo) > 0:
+                    top_tipo_aprobado = (df_top_tipo.groupby("tipo_incidencia").size() / len(df_top_tipo) * 100)\
+                        .sort_values(ascending=False).head(3).round(0).astype(int)
+                    st.subheader("🏆 Top 3 incidencias aprobadas por tipo")
+                    for tipo, pct in top_tipo_aprobado.items():
+                        st.markdown(
+                            f"""<div style="background-color:#cde8ff;padding:10px;border-radius:10px;margin-bottom:5px;text-align:center;font-weight:bold;">{tipo}<br>{pct}%</div>""",
+                            unsafe_allow_html=True
+                        )
+                df_top_tipo_na = df[df["estado_incidencia"] == "No Aprobado"]
+                if len(df_top_tipo_na) > 0:
+                    top_tipo_no_aprobado = (df_top_tipo_na.groupby("tipo_incidencia").size() / len(df_top_tipo_na) * 100)\
+                        .sort_values(ascending=False).head(3).round(0).astype(int)
+                    st.subheader("🏆 Top 3 incidencias no aprobadas por tipo")
+                    for tipo, pct in top_tipo_no_aprobado.items():
+                        st.markdown(
+                            f"""<div style="background-color:#ffc9c9;padding:10px;border-radius:10px;margin-bottom:5px;text-align:center;font-weight:bold;">{tipo}<br>{pct}%</div>""",
+                            unsafe_allow_html=True
+                        )
 
     except Exception as e:
         st.error(f"Error al procesar el archivo: {e}")
